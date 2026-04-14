@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 //--- Input Parameters
@@ -16,8 +16,10 @@ input int        MaxTrades        = 2;           // Max simultaneous trades
 input int        MagicNumber      = 123456;      // Magic Number
 
 input string     _sep2_           = "=== Timeframe Settings ===";
-input ENUM_TIMEFRAMES HTF_Period  = PERIOD_M15;  // Higher Timeframe (Fractal Detection)
-input ENUM_TIMEFRAMES LTF_Period  = PERIOD_M1;   // Lower Timeframe (Breaker Block Entry)
+input ENUM_TIMEFRAMES HTF_Period_1 = PERIOD_M15;  // Higher Timeframe 1 (Fractal Detection)
+input bool       UseHTF2          = false;        // Enable second Higher Timeframe?
+input ENUM_TIMEFRAMES HTF_Period_2 = PERIOD_M5;   // Higher Timeframe 2 (Fractal Detection)
+input ENUM_TIMEFRAMES LTF_Period   = PERIOD_M1;   // Lower Timeframe (Breaker Block Entry)
 
 input string     _sep3_           = "=== Entry Settings ===";
 enum ENTRY_MODE  { OPTION_1=0, OPTION_2=1, BOTH_OPTIONS=2 };
@@ -42,7 +44,8 @@ struct FractalLevel {
    double price;
    datetime time;
    int barIndex;
-   bool isHigh; // true=fractal high, false=fractal low
+   bool isHigh;          // true=fractal high, false=fractal low
+   int htfSource;        // 1 or 2 (which HTF detected it)
 };
 
 struct BreakerBlock {
@@ -50,30 +53,20 @@ struct BreakerBlock {
    double bottom;
    datetime time;
    int barIndex;
-   bool isBullish; // true = bullish breaker (looking for buys)
-};
-
-struct TradeSignal {
-   int type;      // OP_BUY or OP_SELL
-   double entry;
-   double sl;
-   double tp;
-   int option;    // 1 or 2
-   string reason;
+   bool isBullish;       // true = bullish breaker (looking for buys)
 };
 
 //--- Arrays for detected levels
 FractalLevel g_fractalLows[];
 FractalLevel g_fractalHighs[];
-BreakerBlock g_bullishBreakers[];
-BreakerBlock g_bearishBreakers[];
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("FractalBreakerEA initialized. HTF=", EnumToString(HTF_Period),
+   Print("FractalBreakerEA v1.10 initialized. HTF1=", EnumToString(HTF_Period_1),
+         " HTF2=", (UseHTF2 ? EnumToString(HTF_Period_2) : "Disabled"),
          " LTF=", EnumToString(LTF_Period));
    return(INIT_SUCCEEDED);
 }
@@ -99,12 +92,8 @@ void OnTick()
    // Check max trades
    if(CountOpenTrades() >= MaxTrades) return;
 
-   // Step 1: Detect fractals on higher timeframe
-   DetectFractals();
-
-   // Step 2: Check for liquidity raids (fractal sweeps)
-   // Step 3: Find breaker blocks on lower timeframe
-   // Step 4: Generate entry signals
+   // Step 1: Detect fractals on higher timeframe(s)
+   DetectAllFractals();
 
    // Check for BUY setups
    if(TradeDirection == BOTH_DIRS || TradeDirection == BUY_ONLY)
@@ -120,26 +109,41 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Detect Williams-style fractals on the higher timeframe            |
+//| Detect fractals on all enabled higher timeframes                  |
 //+------------------------------------------------------------------+
-void DetectFractals()
+void DetectAllFractals()
 {
    ArrayResize(g_fractalLows, 0);
    ArrayResize(g_fractalHighs, 0);
 
+   // Detect on HTF 1
+   DetectFractalsOnTF(HTF_Period_1, 1);
+
+   // Detect on HTF 2 if enabled
+   if(UseHTF2)
+   {
+      DetectFractalsOnTF(HTF_Period_2, 2);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect Williams-style fractals on a specific timeframe            |
+//+------------------------------------------------------------------+
+void DetectFractalsOnTF(ENUM_TIMEFRAMES tf, int source)
+{
    int n = FractalBars;
 
    for(int i = n; i < HTF_LookbackBars - n; i++)
    {
-      double high_i = iHigh(Symbol(), HTF_Period, i);
-      double low_i  = iLow(Symbol(), HTF_Period, i);
+      double high_i = iHigh(Symbol(), tf, i);
+      double low_i  = iLow(Symbol(), tf, i);
 
       // Check fractal high
       bool isHigh = true;
       for(int j = 1; j <= n; j++)
       {
-         if(iHigh(Symbol(), HTF_Period, i - j) >= high_i ||
-            iHigh(Symbol(), HTF_Period, i + j) >= high_i)
+         if(iHigh(Symbol(), tf, i - j) >= high_i ||
+            iHigh(Symbol(), tf, i + j) >= high_i)
          {
             isHigh = false;
             break;
@@ -149,18 +153,19 @@ void DetectFractals()
       {
          int sz = ArraySize(g_fractalHighs);
          ArrayResize(g_fractalHighs, sz + 1);
-         g_fractalHighs[sz].price    = high_i;
-         g_fractalHighs[sz].time     = iTime(Symbol(), HTF_Period, i);
-         g_fractalHighs[sz].barIndex = i;
-         g_fractalHighs[sz].isHigh   = true;
+         g_fractalHighs[sz].price     = high_i;
+         g_fractalHighs[sz].time      = iTime(Symbol(), tf, i);
+         g_fractalHighs[sz].barIndex  = i;
+         g_fractalHighs[sz].isHigh    = true;
+         g_fractalHighs[sz].htfSource = source;
       }
 
       // Check fractal low
       bool isLow = true;
       for(int j = 1; j <= n; j++)
       {
-         if(iLow(Symbol(), HTF_Period, i - j) <= low_i ||
-            iLow(Symbol(), HTF_Period, i + j) <= low_i)
+         if(iLow(Symbol(), tf, i - j) <= low_i ||
+            iLow(Symbol(), tf, i + j) <= low_i)
          {
             isLow = false;
             break;
@@ -170,52 +175,37 @@ void DetectFractals()
       {
          int sz = ArraySize(g_fractalLows);
          ArrayResize(g_fractalLows, sz + 1);
-         g_fractalLows[sz].price    = low_i;
-         g_fractalLows[sz].time     = iTime(Symbol(), HTF_Period, i);
-         g_fractalLows[sz].barIndex = i;
-         g_fractalLows[sz].isHigh   = false;
+         g_fractalLows[sz].price     = low_i;
+         g_fractalLows[sz].time      = iTime(Symbol(), tf, i);
+         g_fractalLows[sz].barIndex  = i;
+         g_fractalLows[sz].isHigh    = false;
+         g_fractalLows[sz].htfSource = source;
       }
    }
 }
 
 //+------------------------------------------------------------------+
 //| Check if a fractal low was raided (swept) - for BUY setup        |
+//| Raid = price goes below the fractal. No recovery needed.         |
 //+------------------------------------------------------------------+
 bool IsFractalLowRaided(double &raidedLevel)
 {
-   double raidThreshold = RaidPips * Point * 10; // convert to price
+   double raidThreshold = RaidPips * Point * 10;
 
    for(int i = 0; i < ArraySize(g_fractalLows); i++)
    {
       double fractalPrice = g_fractalLows[i].price;
 
-      // Check if recent LTF price went below the fractal (raided it)
-      // then came back above it
-      double recentLow = iLow(Symbol(), LTF_Period, 1); // last closed candle
-
-      // Look at recent LTF bars for the raid
-      bool raided = false;
-      bool recovered = false;
-
+      // Check if any recent LTF candle went below the fractal (raided it)
       for(int j = 1; j <= LTF_LookbackBars; j++)
       {
          double lo = iLow(Symbol(), LTF_Period, j);
-         double cl = iClose(Symbol(), LTF_Period, j);
 
          if(lo < fractalPrice - raidThreshold)
-            raided = true;
-
-         if(raided && cl > fractalPrice)
          {
-            recovered = true;
-            break;
+            raidedLevel = fractalPrice;
+            return true;
          }
-      }
-
-      if(raided && recovered)
-      {
-         raidedLevel = fractalPrice;
-         return true;
       }
    }
    return false;
@@ -223,6 +213,7 @@ bool IsFractalLowRaided(double &raidedLevel)
 
 //+------------------------------------------------------------------+
 //| Check if a fractal high was raided (swept) - for SELL setup      |
+//| Raid = price goes above the fractal. No recovery needed.         |
 //+------------------------------------------------------------------+
 bool IsFractalHighRaided(double &raidedLevel)
 {
@@ -232,28 +223,15 @@ bool IsFractalHighRaided(double &raidedLevel)
    {
       double fractalPrice = g_fractalHighs[i].price;
 
-      bool raided = false;
-      bool recovered = false;
-
       for(int j = 1; j <= LTF_LookbackBars; j++)
       {
          double hi = iHigh(Symbol(), LTF_Period, j);
-         double cl = iClose(Symbol(), LTF_Period, j);
 
          if(hi > fractalPrice + raidThreshold)
-            raided = true;
-
-         if(raided && cl < fractalPrice)
          {
-            recovered = true;
-            break;
+            raidedLevel = fractalPrice;
+            return true;
          }
-      }
-
-      if(raided && recovered)
-      {
-         raidedLevel = fractalPrice;
-         return true;
       }
    }
    return false;
@@ -265,19 +243,15 @@ bool IsFractalHighRaided(double &raidedLevel)
 //+------------------------------------------------------------------+
 bool FindBullishBreaker(BreakerBlock &breaker)
 {
-   // Look for: bearish candle followed by strong bullish move
-   // The bearish candle becomes the breaker block
    for(int i = 2; i < LTF_LookbackBars - 1; i++)
    {
       double open_i  = iOpen(Symbol(), LTF_Period, i);
       double close_i = iClose(Symbol(), LTF_Period, i);
-      double high_i  = iHigh(Symbol(), LTF_Period, i);
-      double low_i   = iLow(Symbol(), LTF_Period, i);
 
       // Candle i must be bearish
       if(close_i >= open_i) continue;
 
-      // The candle(s) after it must be bullish and close above the bearish candle's open
+      // The candle after it must be bullish and close above the bearish candle's open
       double close_after = iClose(Symbol(), LTF_Period, i - 1);
       double open_after  = iOpen(Symbol(), LTF_Period, i - 1);
 
@@ -285,10 +259,10 @@ bool FindBullishBreaker(BreakerBlock &breaker)
       if(close_after <= open_i) continue;     // must close above breaker high
 
       // Valid bullish breaker found
-      breaker.top      = open_i;   // bearish candle open = top of breaker
-      breaker.bottom   = close_i;  // bearish candle close = bottom of breaker
-      breaker.time     = iTime(Symbol(), LTF_Period, i);
-      breaker.barIndex = i;
+      breaker.top       = open_i;   // bearish candle open = top of breaker
+      breaker.bottom    = close_i;  // bearish candle close = bottom of breaker
+      breaker.time      = iTime(Symbol(), LTF_Period, i);
+      breaker.barIndex  = i;
       breaker.isBullish = true;
       return true;
    }
@@ -305,8 +279,6 @@ bool FindBearishBreaker(BreakerBlock &breaker)
    {
       double open_i  = iOpen(Symbol(), LTF_Period, i);
       double close_i = iClose(Symbol(), LTF_Period, i);
-      double high_i  = iHigh(Symbol(), LTF_Period, i);
-      double low_i   = iLow(Symbol(), LTF_Period, i);
 
       // Candle i must be bullish
       if(close_i <= open_i) continue;
@@ -319,10 +291,10 @@ bool FindBearishBreaker(BreakerBlock &breaker)
       if(close_after >= open_i) continue;     // must close below breaker low
 
       // Valid bearish breaker found
-      breaker.top      = close_i;  // bullish candle close = top of breaker
-      breaker.bottom   = open_i;   // bullish candle open = bottom of breaker
-      breaker.time     = iTime(Symbol(), LTF_Period, i);
-      breaker.barIndex = i;
+      breaker.top       = close_i;  // bullish candle close = top of breaker
+      breaker.bottom    = open_i;   // bullish candle open = bottom of breaker
+      breaker.time      = iTime(Symbol(), LTF_Period, i);
+      breaker.barIndex  = i;
       breaker.isBullish = false;
       return true;
    }
@@ -527,18 +499,10 @@ double CalculateLotSize(double slDistance, int orderType)
 
    if(tickValue <= 0 || tickSize <= 0) return minLot;
 
-   // Calculate pip value per lot
-   double pipValuePerLot = tickValue / tickSize;
-
    // SL in ticks
    double slTicks = slDistance / tickSize;
 
-   // Risk = lots * slTicks * tickValue
-   // Account for commission: effective risk = monetary risk + commission cost
-   // Commission is per lot, so: RiskAmount = lots * slTicks * tickValue + lots * CommissionPerLot
-   // RiskAmount = lots * (slTicks * tickValue + CommissionPerLot)
    // lots = RiskAmount / (slTicks * tickValue + CommissionPerLot)
-
    double costPerLot = (slTicks * tickValue) + CommissionPerLot;
    if(costPerLot <= 0) return minLot;
 
