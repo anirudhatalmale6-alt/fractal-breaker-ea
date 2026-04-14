@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "2.21"
+#property version   "3.00"
 #property strict
 
 //--- Input Parameters
@@ -24,34 +24,32 @@ input ENUM_TIMEFRAMES LTF_Period   = PERIOD_M1;   // Lower Timeframe (Breaker Bl
 input string     _sep3_           = "=== Entry Settings ===";
 enum ENTRY_MODE  { OPTION_1=0, OPTION_2=1, BOTH_OPTIONS=2 };
 input ENTRY_MODE EntryMode        = BOTH_OPTIONS; // Entry Mode
-// Option 1 = Candle breaks above breaker, then retest of breaker = entry
-// Option 2 = Candle close above/below breaker = entry
+// Option 1 = After candle closes above breaker, wait for retest = entry
+// Option 2 = Candle close above breaker = immediate entry
 
 enum TRADE_DIR   { BOTH_DIRS=0, BUY_ONLY=1, SELL_ONLY=2 };
 input TRADE_DIR  TradeDirection   = BOTH_DIRS;    // Trade Direction
 
 input string     _sep4_           = "=== Fractal Settings ===";
 input int        FractalBars      = 3;           // Fractal detection bars each side (HTF)
-input int        LTF_SwingBars    = 3;           // Swing detection bars each side (LTF breaker)
+input int        LTF_SwingBars    = 3;           // Swing detection bars each side (LTF)
 input int        HTF_LookbackBars = 20;          // HTF bars to look back for fractals
 input int        LTF_LookbackBars = 200;         // LTF bars to look back
-input int        RaidPips         = 0;           // Min pips price must go beyond fractal (0=any)
-input int        SetupExpiryBars  = 0;           // Max LTF bars after raid to enter (0=no limit)
+input int        RaidPips         = 0;           // Min pips beyond fractal (0=any)
 
 input string     _sep5_           = "=== Debug ===";
-input bool       EnableDebugLog   = false;       // Print debug info to Experts log
+input bool       EnableDebugLog   = false;       // Print debug info to Journal
 
 //--- Global variables
 datetime g_lastBarTime = 0;
-datetime g_lastBuyRaidFractalTime  = 0;
-datetime g_lastSellRaidFractalTime = 0;
+datetime g_lastBuyFractalUsed  = 0;
+datetime g_lastSellFractalUsed = 0;
 
 //--- Structures
 struct FractalLevel {
    double price;
    datetime time;
    int barIndex;
-   bool isHigh;
    int htfSource;
    ENUM_TIMEFRAMES tf;
 };
@@ -60,26 +58,24 @@ struct RaidInfo {
    double fractalPrice;
    datetime fractalTime;
    int raidBarLTF;
-   datetime raidTime;
    int fractalLTFBar;
 };
 
 struct BreakerInfo {
-   double level;       // the breaker price level
-   double slLevel;     // SL price level
-   int breakerBar;     // LTF bar of breaker
+   double level;       // breaker price (the high/low before the LTF fractal)
+   double slLevel;     // SL price (the LTF fractal low/high itself)
+   int breakerBar;     // LTF bar index of the breaker high/low
+   int fractalBar;     // LTF bar index of the LTF fractal low/high
 };
 
-//--- Arrays
 FractalLevel g_htfFractalLows[];
 FractalLevel g_htfFractalHighs[];
-int g_debugCounter = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("FractalBreakerEA v2.10 initialized. HTF1=", EnumToString(HTF_Period_1),
-         " HTF2=", (UseHTF2 ? EnumToString(HTF_Period_2) : "Disabled"),
+   Print("FractalBreakerEA v3.00. HTF1=", EnumToString(HTF_Period_1),
+         " HTF2=", (UseHTF2 ? EnumToString(HTF_Period_2) : "Off"),
          " LTF=", EnumToString(LTF_Period));
    return(INIT_SUCCEEDED);
 }
@@ -97,19 +93,6 @@ void OnTick()
 
    DetectHTFFractals();
 
-   g_debugCounter++;
-   if(EnableDebugLog && g_debugCounter % 60 == 1)
-   {
-      Print("DEBUG FRACTALS: ", ArraySize(g_htfFractalLows), " lows, ",
-            ArraySize(g_htfFractalHighs), " highs detected on HTF");
-      for(int fi = 0; fi < ArraySize(g_htfFractalLows); fi++)
-         Print("  FractalLow[", fi, "] price=", g_htfFractalLows[fi].price,
-               " time=", TimeToString(g_htfFractalLows[fi].time));
-      for(int fi = 0; fi < ArraySize(g_htfFractalHighs); fi++)
-         Print("  FractalHigh[", fi, "] price=", g_htfFractalHighs[fi].price,
-               " time=", TimeToString(g_htfFractalHighs[fi].time));
-   }
-
    if(TradeDirection == BOTH_DIRS || TradeDirection == BUY_ONLY)
       CheckBuySetup();
    if(TradeDirection == BOTH_DIRS || TradeDirection == SELL_ONLY)
@@ -117,12 +100,28 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+//| HTF Fractal Detection                                             |
+//+------------------------------------------------------------------+
 void DetectHTFFractals()
 {
    ArrayResize(g_htfFractalLows, 0);
    ArrayResize(g_htfFractalHighs, 0);
    DetectFractalsOnTF(HTF_Period_1, FractalBars, 1);
    if(UseHTF2) DetectFractalsOnTF(HTF_Period_2, FractalBars, 2);
+
+   if(EnableDebugLog)
+   {
+      static int logCount = 0;
+      logCount++;
+      if(logCount % 60 == 1)
+      {
+         Print("HTF: ", ArraySize(g_htfFractalLows), " lows, ",
+               ArraySize(g_htfFractalHighs), " highs");
+         for(int i = 0; i < MathMin(ArraySize(g_htfFractalLows), 5); i++)
+            Print("  Low[", i, "] ", g_htfFractalLows[i].price,
+                  " @ ", TimeToString(g_htfFractalLows[i].time));
+      }
+   }
 }
 
 void DetectFractalsOnTF(ENUM_TIMEFRAMES tf, int nBars, int source)
@@ -145,7 +144,6 @@ void DetectFractalsOnTF(ENUM_TIMEFRAMES tf, int nBars, int source)
          g_htfFractalHighs[sz].price = high_i;
          g_htfFractalHighs[sz].time = iTime(Symbol(), tf, i);
          g_htfFractalHighs[sz].barIndex = i;
-         g_htfFractalHighs[sz].isHigh = true;
          g_htfFractalHighs[sz].htfSource = source;
          g_htfFractalHighs[sz].tf = tf;
       }
@@ -163,7 +161,6 @@ void DetectFractalsOnTF(ENUM_TIMEFRAMES tf, int nBars, int source)
          g_htfFractalLows[sz].price = low_i;
          g_htfFractalLows[sz].time = iTime(Symbol(), tf, i);
          g_htfFractalLows[sz].barIndex = i;
-         g_htfFractalLows[sz].isHigh = false;
          g_htfFractalLows[sz].htfSource = source;
          g_htfFractalLows[sz].tf = tf;
       }
@@ -182,38 +179,31 @@ int HTFTimeToLTFBar(datetime htfTime)
 }
 
 //+------------------------------------------------------------------+
-//| Check if bar i is a swing HIGH on LTF (local peak)               |
+//| LTF Swing Detection helpers                                       |
 //+------------------------------------------------------------------+
-bool IsLTFSwingHigh(int i)
+bool IsSwingHigh(int bar)
 {
    int n = LTF_SwingBars;
-   if(i - n < 0 || i + n >= LTF_LookbackBars) return false;
-
-   double high_i = iHigh(Symbol(), LTF_Period, i);
-
+   if(bar - n < 0 || bar + n >= LTF_LookbackBars) return false;
+   double h = iHigh(Symbol(), LTF_Period, bar);
    for(int j = 1; j <= n; j++)
    {
-      if(iHigh(Symbol(), LTF_Period, i-j) >= high_i ||
-         iHigh(Symbol(), LTF_Period, i+j) >= high_i)
+      if(iHigh(Symbol(), LTF_Period, bar-j) >= h ||
+         iHigh(Symbol(), LTF_Period, bar+j) >= h)
          return false;
    }
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Check if bar i is a swing LOW on LTF (local trough)              |
-//+------------------------------------------------------------------+
-bool IsLTFSwingLow(int i)
+bool IsSwingLow(int bar)
 {
    int n = LTF_SwingBars;
-   if(i - n < 0 || i + n >= LTF_LookbackBars) return false;
-
-   double low_i = iLow(Symbol(), LTF_Period, i);
-
+   if(bar - n < 0 || bar + n >= LTF_LookbackBars) return false;
+   double l = iLow(Symbol(), LTF_Period, bar);
    for(int j = 1; j <= n; j++)
    {
-      if(iLow(Symbol(), LTF_Period, i-j) <= low_i ||
-         iLow(Symbol(), LTF_Period, i+j) <= low_i)
+      if(iLow(Symbol(), LTF_Period, bar-j) <= l ||
+         iLow(Symbol(), LTF_Period, bar+j) <= l)
          return false;
    }
    return true;
@@ -222,40 +212,42 @@ bool IsLTFSwingLow(int i)
 //+------------------------------------------------------------------+
 //| Find HTF fractal LOW raid                                         |
 //+------------------------------------------------------------------+
-bool FindHTFFractalLowRaid(RaidInfo &raid)
+bool FindBuyRaid(RaidInfo &raid)
 {
-   double raidThreshold = RaidPips * Point * 10;
+   double threshold = RaidPips * Point * 10;
 
    for(int i = 0; i < ArraySize(g_htfFractalLows); i++)
    {
-      double fractalPrice = g_htfFractalLows[i].price;
-      datetime fractalTime = g_htfFractalLows[i].time;
+      double fp = g_htfFractalLows[i].price;
+      datetime ft = g_htfFractalLows[i].time;
+      if(ft == g_lastBuyFractalUsed) continue;
 
-      if(fractalTime == g_lastBuyRaidFractalTime) continue;
+      int fBar = HTFTimeToLTFBar(ft);
+      if(fBar < 0) continue;
 
-      int fractalLTFBar = HTFTimeToLTFBar(fractalTime);
-      if(fractalLTFBar < 0) continue;
-
-      // Find raid bar (first LTF bar after fractal that goes below it)
-      int raidBar = -1;
-      for(int j = fractalLTFBar - 1; j >= 1; j--)
+      // Find raid: first LTF bar after fractal that goes below it
+      for(int j = fBar - 1; j >= 1; j--)
       {
-         if(iLow(Symbol(), LTF_Period, j) < fractalPrice - raidThreshold)
-         { raidBar = j; break; }
+         if(iLow(Symbol(), LTF_Period, j) < fp - threshold)
+         {
+            raid.fractalPrice = fp;
+            raid.fractalTime = ft;
+            raid.raidBarLTF = j;
+            raid.fractalLTFBar = fBar;
+
+            if(EnableDebugLog)
+               Print("BUY RAID: Frac=", fp, " FracBar=", fBar,
+                     " RaidBar=", j, " @ ", TimeToString(iTime(Symbol(), LTF_Period, j)));
+            return true;
+         }
       }
-      if(raidBar < 0) continue;
-      if(SetupExpiryBars > 0 && raidBar > SetupExpiryBars) continue;
-
-      if(EnableDebugLog)
-         Print("DEBUG BUY RAID: Fractal=", fractalPrice,
-               " FracLTF=", fractalLTFBar, " RaidBar=", raidBar);
-
-      raid.fractalPrice = fractalPrice;
-      raid.fractalTime = fractalTime;
-      raid.raidBarLTF = raidBar;
-      raid.raidTime = iTime(Symbol(), LTF_Period, raidBar);
-      raid.fractalLTFBar = fractalLTFBar;
-      return true;
+   }
+   if(EnableDebugLog)
+   {
+      static int noRaidLog = 0;
+      noRaidLog++;
+      if(noRaidLog % 60 == 1)
+         Print("BUY: No raid found");
    }
    return false;
 }
@@ -263,128 +255,155 @@ bool FindHTFFractalLowRaid(RaidInfo &raid)
 //+------------------------------------------------------------------+
 //| Find HTF fractal HIGH raid                                        |
 //+------------------------------------------------------------------+
-bool FindHTFFractalHighRaid(RaidInfo &raid)
+bool FindSellRaid(RaidInfo &raid)
 {
-   double raidThreshold = RaidPips * Point * 10;
+   double threshold = RaidPips * Point * 10;
 
    for(int i = 0; i < ArraySize(g_htfFractalHighs); i++)
    {
-      double fractalPrice = g_htfFractalHighs[i].price;
-      datetime fractalTime = g_htfFractalHighs[i].time;
+      double fp = g_htfFractalHighs[i].price;
+      datetime ft = g_htfFractalHighs[i].time;
+      if(ft == g_lastSellFractalUsed) continue;
 
-      if(fractalTime == g_lastSellRaidFractalTime) continue;
+      int fBar = HTFTimeToLTFBar(ft);
+      if(fBar < 0) continue;
 
-      int fractalLTFBar = HTFTimeToLTFBar(fractalTime);
-      if(fractalLTFBar < 0) continue;
-
-      int raidBar = -1;
-      for(int j = fractalLTFBar - 1; j >= 1; j--)
+      for(int j = fBar - 1; j >= 1; j--)
       {
-         if(iHigh(Symbol(), LTF_Period, j) > fractalPrice + raidThreshold)
-         { raidBar = j; break; }
-      }
-      if(raidBar < 0) continue;
-      if(SetupExpiryBars > 0 && raidBar > SetupExpiryBars) continue;
-
-      if(EnableDebugLog)
-         Print("DEBUG SELL RAID: Fractal=", fractalPrice,
-               " FracLTF=", fractalLTFBar, " RaidBar=", raidBar);
-
-      raid.fractalPrice = fractalPrice;
-      raid.fractalTime = fractalTime;
-      raid.raidBarLTF = raidBar;
-      raid.raidTime = iTime(Symbol(), LTF_Period, raidBar);
-      raid.fractalLTFBar = fractalLTFBar;
-      return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Find bullish breaker for BUY                                      |
-//| Breaker = the swing high (local peak) RIGHT BEFORE the drop      |
-//| that raided the fractal. Search backwards from raidBar.           |
-//| SL = lowest point from breaker down to the raid low               |
-//+------------------------------------------------------------------+
-bool FindBullishBreaker(RaidInfo &raid, BreakerInfo &brk)
-{
-   int raidBar = raid.raidBarLTF;
-
-   // Search backwards from raidBar for the first LTF swing high
-   // This is the local peak right before the drop started
-   for(int i = raidBar + 1; i < LTF_LookbackBars - LTF_SwingBars; i++)
-   {
-      if(IsLTFSwingHigh(i))
-      {
-         double breakerLevel = iHigh(Symbol(), LTF_Period, i);
-
-         // SL = lowest point from the breaker to where price reversed
-         // (the lowest low between breaker and present)
-         double lowestLow = DBL_MAX;
-         for(int k = i; k >= 1; k--)
+         if(iHigh(Symbol(), LTF_Period, j) > fp + threshold)
          {
-            double lo = iLow(Symbol(), LTF_Period, k);
-            if(lo < lowestLow) lowestLow = lo;
-            // Stop once price recovered above breaker (we found the bottom)
-            if(k < raidBar && iClose(Symbol(), LTF_Period, k) > breakerLevel)
-               break;
+            raid.fractalPrice = fp;
+            raid.fractalTime = ft;
+            raid.raidBarLTF = j;
+            raid.fractalLTFBar = fBar;
+
+            if(EnableDebugLog)
+               Print("SELL RAID: Frac=", fp, " FracBar=", fBar,
+                     " RaidBar=", j, " @ ", TimeToString(iTime(Symbol(), LTF_Period, j)));
+            return true;
          }
-
-         brk.level      = breakerLevel;
-         brk.slLevel    = lowestLow;
-         brk.breakerBar = i;
-
-         if(EnableDebugLog)
-            Print("DEBUG BUY BREAKER: Level=", breakerLevel,
-                  " at bar ", i, " (", TimeToString(iTime(Symbol(), LTF_Period, i)), ")",
-                  " SL=", lowestLow);
-
-         return true;
       }
    }
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Find bearish breaker for SELL                                     |
-//| Breaker = the swing low (local trough) RIGHT BEFORE the rally    |
-//| that raided the fractal high. Search backwards from raidBar.     |
-//| SL = highest point from breaker up to the raid high              |
+//| Find bullish breaker (for BUY)                                    |
+//| = Most recent LTF fractal low, then the swing high before it     |
+//| SL = the fractal low price                                        |
 //+------------------------------------------------------------------+
-bool FindBearishBreaker(RaidInfo &raid, BreakerInfo &brk)
+bool FindBullishBreaker(BreakerInfo &brk)
 {
-   int raidBar = raid.raidBarLTF;
+   int n = LTF_SwingBars;
 
-   // Search backwards from raidBar for the first LTF swing low
-   for(int i = raidBar + 1; i < LTF_LookbackBars - LTF_SwingBars; i++)
+   // Step 1: Find the most recent LTF fractal low (swing low)
+   int fracLowBar = -1;
+   double fracLowPrice = 0;
+
+   for(int i = n; i < LTF_LookbackBars - n; i++)
    {
-      if(IsLTFSwingLow(i))
+      if(IsSwingLow(i))
       {
-         double breakerLevel = iLow(Symbol(), LTF_Period, i);
-
-         // SL = highest point from breaker to recovery
-         double highestHigh = 0;
-         for(int k = i; k >= 1; k--)
-         {
-            double hi = iHigh(Symbol(), LTF_Period, k);
-            if(hi > highestHigh) highestHigh = hi;
-            if(k < raidBar && iClose(Symbol(), LTF_Period, k) < breakerLevel)
-               break;
-         }
-
-         brk.level      = breakerLevel;
-         brk.slLevel    = highestHigh;
-         brk.breakerBar = i;
-
-         if(EnableDebugLog)
-            Print("DEBUG SELL BREAKER: Level=", breakerLevel,
-                  " at bar ", i, " (", TimeToString(iTime(Symbol(), LTF_Period, i)), ")",
-                  " SL=", highestHigh);
-
-         return true;
+         fracLowBar = i;
+         fracLowPrice = iLow(Symbol(), LTF_Period, i);
+         break; // most recent one
       }
    }
-   return false;
+
+   if(fracLowBar < 0)
+   {
+      if(EnableDebugLog) Print("BUY: No LTF swing low found");
+      return false;
+   }
+
+   // Step 2: Find the swing high BEFORE this fractal low
+   // This is the highest point right before the drop that took out the fractal low
+   int swingHighBar = -1;
+   double swingHighPrice = 0;
+
+   for(int i = fracLowBar + 1; i < LTF_LookbackBars - n; i++)
+   {
+      if(IsSwingHigh(i))
+      {
+         swingHighBar = i;
+         swingHighPrice = iHigh(Symbol(), LTF_Period, i);
+         break; // first (most recent) swing high before the fractal low
+      }
+   }
+
+   if(swingHighBar < 0)
+   {
+      if(EnableDebugLog) Print("BUY: No swing high before LTF fractal low");
+      return false;
+   }
+
+   brk.level = swingHighPrice;
+   brk.slLevel = fracLowPrice;
+   brk.breakerBar = swingHighBar;
+   brk.fractalBar = fracLowBar;
+
+   if(EnableDebugLog)
+      Print("BUY BREAKER: Level=", swingHighPrice,
+            " @ bar ", swingHighBar, " (", TimeToString(iTime(Symbol(), LTF_Period, swingHighBar)), ")",
+            " FracLow=", fracLowPrice,
+            " @ bar ", fracLowBar, " (", TimeToString(iTime(Symbol(), LTF_Period, fracLowBar)), ")");
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Find bearish breaker (for SELL)                                   |
+//| = Most recent LTF fractal high, then the swing low before it     |
+//| SL = the fractal high price                                       |
+//+------------------------------------------------------------------+
+bool FindBearishBreaker(BreakerInfo &brk)
+{
+   int n = LTF_SwingBars;
+
+   // Step 1: Find the most recent LTF fractal high (swing high)
+   int fracHighBar = -1;
+   double fracHighPrice = 0;
+
+   for(int i = n; i < LTF_LookbackBars - n; i++)
+   {
+      if(IsSwingHigh(i))
+      {
+         fracHighBar = i;
+         fracHighPrice = iHigh(Symbol(), LTF_Period, i);
+         break;
+      }
+   }
+
+   if(fracHighBar < 0) return false;
+
+   // Step 2: Find the swing low BEFORE this fractal high
+   int swingLowBar = -1;
+   double swingLowPrice = 0;
+
+   for(int i = fracHighBar + 1; i < LTF_LookbackBars - n; i++)
+   {
+      if(IsSwingLow(i))
+      {
+         swingLowBar = i;
+         swingLowPrice = iLow(Symbol(), LTF_Period, i);
+         break;
+      }
+   }
+
+   if(swingLowBar < 0) return false;
+
+   brk.level = swingLowPrice;
+   brk.slLevel = fracHighPrice;
+   brk.breakerBar = swingLowBar;
+   brk.fractalBar = fracHighBar;
+
+   if(EnableDebugLog)
+      Print("SELL BREAKER: Level=", swingLowPrice,
+            " @ bar ", swingLowBar, " (", TimeToString(iTime(Symbol(), LTF_Period, swingLowBar)), ")",
+            " FracHigh=", fracHighPrice,
+            " @ bar ", fracHighBar, " (", TimeToString(iTime(Symbol(), LTF_Period, fracHighBar)), ")");
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -392,42 +411,41 @@ bool FindBearishBreaker(RaidInfo &raid, BreakerInfo &brk)
 //+------------------------------------------------------------------+
 void CheckBuySetup()
 {
-   // Step 1: Find raid
+   // Step 1: HTF fractal low must be raided
    RaidInfo raid;
-   if(!FindHTFFractalLowRaid(raid))
-   {
-      if(EnableDebugLog && g_debugCounter % 60 == 1)
-         Print("DEBUG BUY: No HTF fractal low raid found");
-      return;
-   }
+   if(!FindBuyRaid(raid)) return;
 
-   // Step 2: Find breaker
+   // Step 2: Find bullish breaker on LTF
    BreakerInfo brk;
-   if(!FindBullishBreaker(raid, brk))
-   {
-      if(EnableDebugLog)
-         Print("DEBUG BUY: No breaker found for raid at bar ", raid.raidBarLTF);
-      return;
-   }
+   if(!FindBullishBreaker(brk)) return;
 
+   // Step 3: Check entry on last closed candle (bar 1)
    double ask = MarketInfo(Symbol(), MODE_ASK);
    double lastClose = iClose(Symbol(), LTF_Period, 1);
    double lastLow   = iLow(Symbol(), LTF_Period, 1);
    double lastOpen  = iOpen(Symbol(), LTF_Period, 1);
-   double bid = MarketInfo(Symbol(), MODE_BID);
-
-   if(EnableDebugLog)
-      Print("DEBUG BUY CHECK: BrkLvl=", brk.level,
-            " LastClose=", lastClose, " LastLow=", lastLow, " LastOpen=", lastOpen,
-            " Ask=", ask);
+   double prevClose = iClose(Symbol(), LTF_Period, 2);
 
    bool opt1 = false;
    bool opt2 = false;
 
-   // Option 1: A candle must have ALREADY closed above the breaker level
-   // (the initial break), then price retests (comes back to) the breaker = entry
+   // Option 2: Candle closes above breaker = immediate entry
+   // Previous candle was below, this one closes above
+   if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
+   {
+      if(lastClose > brk.level && prevClose <= brk.level)
+         opt2 = true;
+
+      if(EnableDebugLog)
+         Print("BUY OPT2: lastClose=", lastClose, " prevClose=", prevClose,
+               " brk=", brk.level, " signal=", opt2);
+   }
+
+   // Option 1: A candle must have already closed above breaker,
+   // then price retests (dips back to) the breaker and bounces
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
+      // Check if any candle between breaker and now already closed above
       bool hasBroken = false;
       for(int k = 2; k < brk.breakerBar; k++)
       {
@@ -435,45 +453,28 @@ void CheckBuySetup()
          { hasBroken = true; break; }
       }
 
-      if(EnableDebugLog)
-         Print("DEBUG BUY OPT1: hasBroken=", hasBroken,
-               " lastLow<=brk=", (lastLow <= brk.level),
-               " lastClose>brk=", (lastClose > brk.level),
-               " bullish=", (lastClose > lastOpen));
-
       if(hasBroken)
       {
+         // Retest: candle dips to breaker level but closes above it
          if(lastLow <= brk.level && lastClose > brk.level && lastClose > lastOpen)
             opt1 = true;
       }
-   }
-
-   // Option 2: Candle closes above breaker level (the first close above it)
-   if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
-   {
-      // Previous candle closed below breaker, this one closes above
-      double prevClose = iClose(Symbol(), LTF_Period, 2);
 
       if(EnableDebugLog)
-         Print("DEBUG BUY OPT2: lastClose>brk=", (lastClose > brk.level),
-               " prevClose<=brk=", (prevClose <= brk.level),
-               " prevClose=", prevClose);
-
-      if(lastClose > brk.level && prevClose <= brk.level)
-         opt2 = true;
+         Print("BUY OPT1: hasBroken=", hasBroken, " lastLow=", lastLow,
+               " brk=", brk.level, " signal=", opt1);
    }
 
    if(!opt1 && !opt2) return;
 
-   // SL
+   // SL = the fractal low (lowest point the breaker caused)
    double sl = brk.slLevel - MarketInfo(Symbol(), MODE_SPREAD) * Point;
    if(sl >= ask) return;
 
-   // TP
    double slDist = ask - sl;
    double tp = ask + (slDist * RR_Ratio) + MarketInfo(Symbol(), MODE_SPREAD) * Point;
 
-   double lots = CalculateLotSize(slDist, OP_BUY);
+   double lots = CalcLots(slDist);
    if(lots <= 0) return;
 
    if(HasTradeAtLevel(brk.level, OP_BUY)) return;
@@ -483,10 +484,10 @@ void CheckBuySetup()
 
    if(ticket > 0)
    {
-      g_lastBuyRaidFractalTime = raid.fractalTime;
+      g_lastBuyFractalUsed = raid.fractalTime;
       Print("BUY #", ticket, " E=", ask, " SL=", sl, " TP=", tp,
             " L=", lots, " Opt=", (opt1?"1":"2"),
-            " BrkLvl=", brk.level, " Frac=", raid.fractalPrice);
+            " Brk=", brk.level, " Frac=", raid.fractalPrice);
    }
    else Print("BUY FAIL: ", GetLastError());
 }
@@ -497,20 +498,28 @@ void CheckBuySetup()
 void CheckSellSetup()
 {
    RaidInfo raid;
-   if(!FindHTFFractalHighRaid(raid)) return;
+   if(!FindSellRaid(raid)) return;
 
    BreakerInfo brk;
-   if(!FindBearishBreaker(raid, brk)) return;
+   if(!FindBearishBreaker(brk)) return;
 
    double bid = MarketInfo(Symbol(), MODE_BID);
    double lastClose = iClose(Symbol(), LTF_Period, 1);
    double lastHigh  = iHigh(Symbol(), LTF_Period, 1);
    double lastOpen  = iOpen(Symbol(), LTF_Period, 1);
+   double prevClose = iClose(Symbol(), LTF_Period, 2);
 
    bool opt1 = false;
    bool opt2 = false;
 
-   // Option 1: Candle already broke below, now retesting from below
+   // Option 2: Candle closes below breaker
+   if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
+   {
+      if(lastClose < brk.level && prevClose >= brk.level)
+         opt2 = true;
+   }
+
+   // Option 1: After break below, retest from below
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
       bool hasBroken = false;
@@ -527,14 +536,6 @@ void CheckSellSetup()
       }
    }
 
-   // Option 2: Candle closes below breaker level (first close below it)
-   if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
-   {
-      double prevClose = iClose(Symbol(), LTF_Period, 2);
-      if(lastClose < brk.level && prevClose >= brk.level)
-         opt2 = true;
-   }
-
    if(!opt1 && !opt2) return;
 
    double sl = brk.slLevel + MarketInfo(Symbol(), MODE_SPREAD) * Point;
@@ -543,7 +544,7 @@ void CheckSellSetup()
    double slDist = sl - bid;
    double tp = bid - (slDist * RR_Ratio) - MarketInfo(Symbol(), MODE_SPREAD) * Point;
 
-   double lots = CalculateLotSize(slDist, OP_SELL);
+   double lots = CalcLots(slDist);
    if(lots <= 0) return;
 
    if(HasTradeAtLevel(brk.level, OP_SELL)) return;
@@ -553,61 +554,61 @@ void CheckSellSetup()
 
    if(ticket > 0)
    {
-      g_lastSellRaidFractalTime = raid.fractalTime;
+      g_lastSellFractalUsed = raid.fractalTime;
       Print("SELL #", ticket, " E=", bid, " SL=", sl, " TP=", tp,
             " L=", lots, " Opt=", (opt1?"1":"2"),
-            " BrkLvl=", brk.level, " Frac=", raid.fractalPrice);
+            " Brk=", brk.level, " Frac=", raid.fractalPrice);
    }
    else Print("SELL FAIL: ", GetLastError());
 }
 
 //+------------------------------------------------------------------+
-double CalculateLotSize(double slDistance, int orderType)
+//| Lot size calculation                                              |
+//+------------------------------------------------------------------+
+double CalcLots(double slDist)
 {
-   if(slDistance <= 0) return 0;
-   double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
-   double tickSize  = MarketInfo(Symbol(), MODE_TICKSIZE);
-   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
-   double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
-   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
-   if(tickValue <= 0 || tickSize <= 0) return minLot;
+   if(slDist <= 0) return 0;
+   double tv = MarketInfo(Symbol(), MODE_TICKVALUE);
+   double ts = MarketInfo(Symbol(), MODE_TICKSIZE);
+   double minL = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxL = MarketInfo(Symbol(), MODE_MAXLOT);
+   double step = MarketInfo(Symbol(), MODE_LOTSTEP);
+   if(tv <= 0 || ts <= 0) return minL;
 
-   double slTicks = slDistance / tickSize;
-   double costPerLot = (slTicks * tickValue) + CommissionPerLot;
-   if(costPerLot <= 0) return minLot;
+   double ticks = slDist / ts;
+   double cost = (ticks * tv) + CommissionPerLot;
+   if(cost <= 0) return minL;
 
-   double lots = RiskAmount / costPerLot;
-   lots = MathFloor(lots / lotStep) * lotStep;
-   if(lots < minLot) lots = minLot;
-   if(lots > maxLot) lots = maxLot;
+   double lots = RiskAmount / cost;
+   lots = MathFloor(lots / step) * step;
+   if(lots < minL) lots = minL;
+   if(lots > maxL) lots = maxL;
    return NormalizeDouble(lots, 2);
 }
 
+//+------------------------------------------------------------------+
 int CountOpenTrades()
 {
-   int count = 0;
+   int c = 0;
    for(int i = OrdersTotal()-1; i >= 0; i--)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderSymbol() != Symbol()) continue;
-      if(OrderMagicNumber() != MagicNumber) continue;
-      if(OrderType() == OP_BUY || OrderType() == OP_SELL) count++;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
+      if(OrderType() == OP_BUY || OrderType() == OP_SELL) c++;
    }
-   return count;
+   return c;
 }
 
 bool HasTradeAtLevel(double level, int type)
 {
-   double tolerance = 10 * Point;
+   double tol = 10 * Point;
    for(int i = OrdersTotal()-1; i >= 0; i--)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderSymbol() != Symbol()) continue;
-      if(OrderMagicNumber() != MagicNumber) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
       if(OrderType() != type) continue;
-      if(MathAbs(OrderOpenPrice() - level) < tolerance) return true;
+      if(MathAbs(OrderOpenPrice() - level) < tol) return true;
    }
    return false;
 }
-
 //+------------------------------------------------------------------+
