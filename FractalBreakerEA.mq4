@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "2.10"
+#property version   "2.20"
 #property strict
 
 //--- Input Parameters
@@ -36,7 +36,7 @@ input int        LTF_SwingBars    = 3;           // Swing detection bars each si
 input int        HTF_LookbackBars = 20;          // HTF bars to look back for fractals
 input int        LTF_LookbackBars = 200;         // LTF bars to look back
 input int        RaidPips         = 0;           // Min pips price must go beyond fractal (0=any)
-input int        SetupExpiryBars  = 60;          // Max LTF bars after raid to enter (0=no limit)
+input int        SetupExpiryBars  = 0;           // Max LTF bars after raid to enter (0=no limit)
 
 input string     _sep5_           = "=== Debug ===";
 input bool       EnableDebugLog   = false;       // Print debug info to Experts log
@@ -95,6 +95,21 @@ void OnTick()
    if(CountOpenTrades() >= MaxTrades) return;
 
    DetectHTFFractals();
+
+   // Log fractal counts periodically
+   static int s_debugCounter = 0;
+   s_debugCounter++;
+   if(EnableDebugLog && s_debugCounter % 60 == 1)
+   {
+      Print("DEBUG FRACTALS: ", ArraySize(g_htfFractalLows), " lows, ",
+            ArraySize(g_htfFractalHighs), " highs detected on HTF");
+      for(int fi = 0; fi < ArraySize(g_htfFractalLows); fi++)
+         Print("  FractalLow[", fi, "] price=", g_htfFractalLows[fi].price,
+               " time=", TimeToString(g_htfFractalLows[fi].time));
+      for(int fi = 0; fi < ArraySize(g_htfFractalHighs); fi++)
+         Print("  FractalHigh[", fi, "] price=", g_htfFractalHighs[fi].price,
+               " time=", TimeToString(g_htfFractalHighs[fi].time));
+   }
 
    if(TradeDirection == BOTH_DIRS || TradeDirection == BUY_ONLY)
       CheckBuySetup();
@@ -378,16 +393,34 @@ bool FindBearishBreaker(RaidInfo &raid, BreakerInfo &brk)
 //+------------------------------------------------------------------+
 void CheckBuySetup()
 {
+   // Step 1: Find raid
    RaidInfo raid;
-   if(!FindHTFFractalLowRaid(raid)) return;
+   if(!FindHTFFractalLowRaid(raid))
+   {
+      if(EnableDebugLog && s_debugCounter % 60 == 1)
+         Print("DEBUG BUY: No HTF fractal low raid found");
+      return;
+   }
 
+   // Step 2: Find breaker
    BreakerInfo brk;
-   if(!FindBullishBreaker(raid, brk)) return;
+   if(!FindBullishBreaker(raid, brk))
+   {
+      if(EnableDebugLog)
+         Print("DEBUG BUY: No breaker found for raid at bar ", raid.raidBarLTF);
+      return;
+   }
 
    double ask = MarketInfo(Symbol(), MODE_ASK);
    double lastClose = iClose(Symbol(), LTF_Period, 1);
    double lastLow   = iLow(Symbol(), LTF_Period, 1);
    double lastOpen  = iOpen(Symbol(), LTF_Period, 1);
+   double bid = MarketInfo(Symbol(), MODE_BID);
+
+   if(EnableDebugLog)
+      Print("DEBUG BUY CHECK: BrkLvl=", brk.level,
+            " LastClose=", lastClose, " LastLow=", lastLow, " LastOpen=", lastOpen,
+            " Ask=", ask);
 
    bool opt1 = false;
    bool opt2 = false;
@@ -396,7 +429,6 @@ void CheckBuySetup()
    // (the initial break), then price retests (comes back to) the breaker = entry
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
-      // Check if a previous candle already broke above
       bool hasBroken = false;
       for(int k = 2; k < brk.breakerBar; k++)
       {
@@ -404,19 +436,31 @@ void CheckBuySetup()
          { hasBroken = true; break; }
       }
 
+      if(EnableDebugLog)
+         Print("DEBUG BUY OPT1: hasBroken=", hasBroken,
+               " lastLow<=brk=", (lastLow <= brk.level),
+               " lastClose>brk=", (lastClose > brk.level),
+               " bullish=", (lastClose > lastOpen));
+
       if(hasBroken)
       {
-         // Retest: candle dips back to breaker level and closes above it (bounce)
          if(lastLow <= brk.level && lastClose > brk.level && lastClose > lastOpen)
             opt1 = true;
       }
    }
 
-   // Option 2: Candle closes above breaker level (first break)
+   // Option 2: Candle closes above breaker level (the first close above it)
    if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
    {
-      // This candle closes above the breaker
-      if(lastClose > brk.level && lastOpen <= brk.level)
+      // Previous candle closed below breaker, this one closes above
+      double prevClose = iClose(Symbol(), LTF_Period, 2);
+
+      if(EnableDebugLog)
+         Print("DEBUG BUY OPT2: lastClose>brk=", (lastClose > brk.level),
+               " prevClose<=brk=", (prevClose <= brk.level),
+               " prevClose=", prevClose);
+
+      if(lastClose > brk.level && prevClose <= brk.level)
          opt2 = true;
    }
 
@@ -484,10 +528,11 @@ void CheckSellSetup()
       }
    }
 
-   // Option 2: Candle closes below breaker level
+   // Option 2: Candle closes below breaker level (first close below it)
    if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
    {
-      if(lastClose < brk.level && lastOpen >= brk.level)
+      double prevClose = iClose(Symbol(), LTF_Period, 2);
+      if(lastClose < brk.level && prevClose >= brk.level)
          opt2 = true;
    }
 
