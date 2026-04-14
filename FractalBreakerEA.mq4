@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "1.30"
+#property version   "1.40"
 #property strict
 
 //--- Input Parameters
@@ -44,18 +44,24 @@ datetime g_lastBarTime = 0;
 struct FractalLevel {
    double price;
    datetime time;
-   int barIndex;
+   int barIndex;       // bar index on its own timeframe
    bool isHigh;
    int htfSource;
 };
 
+struct RaidInfo {
+   double fractalPrice;  // the HTF fractal price that was raided
+   int raidBarLTF;       // LTF bar index where the raid occurred
+   datetime raidTime;    // time of the raid
+};
+
 struct BreakerBlock {
-   double top;           // high of the swing high/low candle
-   double bottom;        // body low of the swing high/low candle
+   double top;           // high of the swing candle
+   double bottom;        // body edge of the swing candle
    double slLevel;       // the lowest/highest point the breaker caused
    datetime time;
-   int barIndex;         // bar index of the breaker (swing high/low candle)
-   int swingLowBar;      // bar index of the swing low/high that was taken out
+   int barIndex;         // LTF bar index of the breaker candle
+   int swingExtremeBar;  // LTF bar index of the swing low/high caused by breaker
    bool isBullish;
 };
 
@@ -68,7 +74,7 @@ FractalLevel g_htfFractalHighs[];
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("FractalBreakerEA v1.30 initialized. HTF1=", EnumToString(HTF_Period_1),
+   Print("FractalBreakerEA v1.40 initialized. HTF1=", EnumToString(HTF_Period_1),
          " HTF2=", (UseHTF2 ? EnumToString(HTF_Period_2) : "Disabled"),
          " LTF=", EnumToString(LTF_Period));
    return(INIT_SUCCEEDED);
@@ -184,22 +190,49 @@ void DetectFractalsOnTF(ENUM_TIMEFRAMES tf, int nBars, int source)
 }
 
 //+------------------------------------------------------------------+
-//| Check if a HTF fractal low was raided on the LTF                 |
+//| Convert a HTF time to an approximate LTF bar index               |
 //+------------------------------------------------------------------+
-bool IsHTFFractalLowRaided(double &raidedLevel)
+int HTFTimeToLTFBar(datetime htfTime)
+{
+   // Find the LTF bar that corresponds to this HTF time
+   for(int i = 0; i < LTF_LookbackBars; i++)
+   {
+      if(iTime(Symbol(), LTF_Period, i) <= htfTime)
+         return i;
+   }
+   return LTF_LookbackBars - 1;
+}
+
+//+------------------------------------------------------------------+
+//| Find the most recent HTF fractal low raid on LTF                 |
+//| Returns raid info with the LTF bar where raid occurred            |
+//| Enforces temporal order: fractal must exist BEFORE raid           |
+//+------------------------------------------------------------------+
+bool FindHTFFractalLowRaid(RaidInfo &raid)
 {
    double raidThreshold = RaidPips * Point * 10;
 
+   // Check each HTF fractal low, starting from most recent
    for(int i = 0; i < ArraySize(g_htfFractalLows); i++)
    {
       double fractalPrice = g_htfFractalLows[i].price;
+      datetime fractalTime = g_htfFractalLows[i].time;
 
-      for(int j = 1; j <= LTF_LookbackBars; j++)
+      // Find the LTF bar index where this fractal was formed
+      int fractalLTFBar = HTFTimeToLTFBar(fractalTime);
+
+      // The raid must happen AFTER the fractal formed (lower bar index = more recent)
+      // Scan from the fractal bar towards the present for the raid
+      for(int j = fractalLTFBar - 1; j >= 1; j--)
       {
          double lo = iLow(Symbol(), LTF_Period, j);
+
          if(lo < fractalPrice - raidThreshold)
          {
-            raidedLevel = fractalPrice;
+            // Found the raid - record it
+            raid.fractalPrice = fractalPrice;
+            raid.raidBarLTF   = j;
+            raid.raidTime     = iTime(Symbol(), LTF_Period, j);
             return true;
          }
       }
@@ -208,22 +241,28 @@ bool IsHTFFractalLowRaided(double &raidedLevel)
 }
 
 //+------------------------------------------------------------------+
-//| Check if a HTF fractal high was raided on the LTF                |
+//| Find the most recent HTF fractal high raid on LTF                |
 //+------------------------------------------------------------------+
-bool IsHTFFractalHighRaided(double &raidedLevel)
+bool FindHTFFractalHighRaid(RaidInfo &raid)
 {
    double raidThreshold = RaidPips * Point * 10;
 
    for(int i = 0; i < ArraySize(g_htfFractalHighs); i++)
    {
       double fractalPrice = g_htfFractalHighs[i].price;
+      datetime fractalTime = g_htfFractalHighs[i].time;
 
-      for(int j = 1; j <= LTF_LookbackBars; j++)
+      int fractalLTFBar = HTFTimeToLTFBar(fractalTime);
+
+      for(int j = fractalLTFBar - 1; j >= 1; j--)
       {
          double hi = iHigh(Symbol(), LTF_Period, j);
+
          if(hi > fractalPrice + raidThreshold)
          {
-            raidedLevel = fractalPrice;
+            raid.fractalPrice = fractalPrice;
+            raid.raidBarLTF   = j;
+            raid.raidTime     = iTime(Symbol(), LTF_Period, j);
             return true;
          }
       }
@@ -232,20 +271,23 @@ bool IsHTFFractalHighRaided(double &raidedLevel)
 }
 
 //+------------------------------------------------------------------+
-//| Find a fractal (swing) low on the LTF                            |
-//| Returns the most recent swing low                                 |
+//| Find the LTF swing low AFTER the raid (for BUY setup)            |
+//| The swing low must occur at or after the raid bar                 |
 //+------------------------------------------------------------------+
-bool FindLTFSwingLow(int &swingBar, double &swingPrice)
+bool FindLTFSwingLowAfterRaid(int raidBar, int &swingBar, double &swingPrice)
 {
    int n = LTF_FractalBars;
 
-   for(int i = n; i < LTF_LookbackBars - n; i++)
+   // Search from raid bar towards the present for a swing low
+   for(int i = raidBar; i >= n; i--)
    {
       double low_i = iLow(Symbol(), LTF_Period, i);
 
       bool isLow = true;
       for(int j = 1; j <= n; j++)
       {
+         if(i - j < 0 || i + j >= LTF_LookbackBars) { isLow = false; break; }
+
          if(iLow(Symbol(), LTF_Period, i - j) <= low_i ||
             iLow(Symbol(), LTF_Period, i + j) <= low_i)
          {
@@ -265,20 +307,21 @@ bool FindLTFSwingLow(int &swingBar, double &swingPrice)
 }
 
 //+------------------------------------------------------------------+
-//| Find a fractal (swing) high on the LTF                           |
-//| Returns the most recent swing high                                |
+//| Find the LTF swing high AFTER the raid (for SELL setup)          |
 //+------------------------------------------------------------------+
-bool FindLTFSwingHigh(int &swingBar, double &swingPrice)
+bool FindLTFSwingHighAfterRaid(int raidBar, int &swingBar, double &swingPrice)
 {
    int n = LTF_FractalBars;
 
-   for(int i = n; i < LTF_LookbackBars - n; i++)
+   for(int i = raidBar; i >= n; i--)
    {
       double high_i = iHigh(Symbol(), LTF_Period, i);
 
       bool isHigh = true;
       for(int j = 1; j <= n; j++)
       {
+         if(i - j < 0 || i + j >= LTF_LookbackBars) { isHigh = false; break; }
+
          if(iHigh(Symbol(), LTF_Period, i - j) >= high_i ||
             iHigh(Symbol(), LTF_Period, i + j) >= high_i)
          {
@@ -299,19 +342,19 @@ bool FindLTFSwingHigh(int &swingBar, double &swingPrice)
 
 //+------------------------------------------------------------------+
 //| Find bullish breaker block for BUY setup                         |
-//| Breaker = the most recent swing HIGH on LTF that preceded        |
-//| the move down which took out the LTF fractal low                  |
-//| SL = the lowest point the breaker caused (the swing low)         |
+//| Sequence: HTF fractal low -> raid -> LTF swing low -> find the   |
+//| swing HIGH before the swing low = breaker block                   |
+//| SL = the swing low (lowest point the breaker caused)             |
 //+------------------------------------------------------------------+
-bool FindBullishBreaker(BreakerBlock &breaker)
+bool FindBullishBreaker(int raidBar, BreakerBlock &breaker)
 {
-   // Step 1: Find the most recent LTF swing low (fractal low)
+   // Step 1: Find the most recent LTF swing low AT or AFTER the raid
    int swingLowBar = 0;
    double swingLowPrice = 0;
-   if(!FindLTFSwingLow(swingLowBar, swingLowPrice)) return false;
+   if(!FindLTFSwingLowAfterRaid(raidBar, swingLowBar, swingLowPrice)) return false;
 
-   // Step 2: Find the most recent swing HIGH that occurred BEFORE this swing low
-   // This is the high point from which price dropped to create the swing low
+   // Step 2: Find the most recent swing HIGH BEFORE the swing low
+   // This is the highest point from which price dropped to create the swing low
    int n = LTF_FractalBars;
 
    for(int i = swingLowBar + 1; i < LTF_LookbackBars - n; i++)
@@ -321,7 +364,6 @@ bool FindBullishBreaker(BreakerBlock &breaker)
       bool isHigh = true;
       for(int j = 1; j <= n; j++)
       {
-         // Check bounds
          if(i - j < 0 || i + j >= LTF_LookbackBars) { isHigh = false; break; }
 
          if(iHigh(Symbol(), LTF_Period, i - j) >= high_i ||
@@ -334,19 +376,18 @@ bool FindBullishBreaker(BreakerBlock &breaker)
 
       if(isHigh)
       {
-         // Found the swing high (breaker) that preceded the swing low
          double candleOpen  = iOpen(Symbol(), LTF_Period, i);
          double candleClose = iClose(Symbol(), LTF_Period, i);
          double candleHigh  = iHigh(Symbol(), LTF_Period, i);
 
-         // Breaker zone = the body of the swing high candle
-         breaker.top        = candleHigh;
-         breaker.bottom     = MathMax(candleOpen, candleClose); // body top
-         breaker.slLevel    = swingLowPrice; // SL at the lowest point the breaker caused
-         breaker.time       = iTime(Symbol(), LTF_Period, i);
-         breaker.barIndex   = i;
-         breaker.swingLowBar = swingLowBar;
-         breaker.isBullish  = true;
+         // Breaker zone = from body top to candle high
+         breaker.top            = candleHigh;
+         breaker.bottom         = MathMax(candleOpen, candleClose);
+         breaker.slLevel        = swingLowPrice;
+         breaker.time           = iTime(Symbol(), LTF_Period, i);
+         breaker.barIndex       = i;
+         breaker.swingExtremeBar = swingLowBar;
+         breaker.isBullish      = true;
 
          return true;
       }
@@ -356,18 +397,18 @@ bool FindBullishBreaker(BreakerBlock &breaker)
 
 //+------------------------------------------------------------------+
 //| Find bearish breaker block for SELL setup                        |
-//| Breaker = the most recent swing LOW on LTF that preceded         |
-//| the move up which took out the LTF fractal high                   |
-//| SL = the highest point the breaker caused (the swing high)       |
+//| Sequence: HTF fractal high -> raid -> LTF swing high -> find     |
+//| the swing LOW before the swing high = breaker block               |
+//| SL = the swing high (highest point the breaker caused)           |
 //+------------------------------------------------------------------+
-bool FindBearishBreaker(BreakerBlock &breaker)
+bool FindBearishBreaker(int raidBar, BreakerBlock &breaker)
 {
-   // Step 1: Find the most recent LTF swing high (fractal high)
+   // Step 1: Find the most recent LTF swing high AT or AFTER the raid
    int swingHighBar = 0;
    double swingHighPrice = 0;
-   if(!FindLTFSwingHigh(swingHighBar, swingHighPrice)) return false;
+   if(!FindLTFSwingHighAfterRaid(raidBar, swingHighBar, swingHighPrice)) return false;
 
-   // Step 2: Find the most recent swing LOW that occurred BEFORE this swing high
+   // Step 2: Find the most recent swing LOW BEFORE the swing high
    int n = LTF_FractalBars;
 
    for(int i = swingHighBar + 1; i < LTF_LookbackBars - n; i++)
@@ -393,14 +434,14 @@ bool FindBearishBreaker(BreakerBlock &breaker)
          double candleClose = iClose(Symbol(), LTF_Period, i);
          double candleLow   = iLow(Symbol(), LTF_Period, i);
 
-         // Breaker zone = the body of the swing low candle
-         breaker.top        = MathMin(candleOpen, candleClose); // body bottom
-         breaker.bottom     = candleLow;
-         breaker.slLevel    = swingHighPrice; // SL at the highest point the breaker caused
-         breaker.time       = iTime(Symbol(), LTF_Period, i);
-         breaker.barIndex   = i;
-         breaker.swingLowBar = swingHighBar; // reusing field for the swing high bar
-         breaker.isBullish  = false;
+         // Breaker zone = from candle low to body bottom
+         breaker.top            = MathMin(candleOpen, candleClose);
+         breaker.bottom         = candleLow;
+         breaker.slLevel        = swingHighPrice;
+         breaker.time           = iTime(Symbol(), LTF_Period, i);
+         breaker.barIndex       = i;
+         breaker.swingExtremeBar = swingHighBar;
+         breaker.isBullish      = false;
 
          return true;
       }
@@ -413,19 +454,18 @@ bool FindBearishBreaker(BreakerBlock &breaker)
 //+------------------------------------------------------------------+
 void CheckBuySetup()
 {
-   double raidedLevel = 0;
+   // Step 1: Find HTF fractal low raid (with temporal ordering)
+   RaidInfo raid;
+   if(!FindHTFFractalLowRaid(raid)) return;
 
-   // Step 1: Check if a HTF fractal low was raided
-   if(!IsHTFFractalLowRaided(raidedLevel)) return;
-
-   // Step 2: Find bullish breaker block
+   // Step 2: Find bullish breaker block (must be after raid)
    BreakerBlock breaker;
-   if(!FindBullishBreaker(breaker)) return;
+   if(!FindBullishBreaker(raid.raidBarLTF, breaker)) return;
 
-   // Step 3: Verify price has moved above the breaker zone after the swing low
-   // (confirms the reversal happened)
+   // Step 3: Verify price has reversed and moved above the breaker zone
+   // after the swing low (confirms the setup is live)
    bool priceAboveBreaker = false;
-   for(int k = breaker.swingLowBar - 1; k >= 1; k--)
+   for(int k = breaker.swingExtremeBar - 1; k >= 1; k--)
    {
       if(iClose(Symbol(), LTF_Period, k) > breaker.bottom)
       {
@@ -446,12 +486,11 @@ void CheckBuySetup()
    bool option2_signal = false;
 
    // Option 1: RETEST - Price came back down to the breaker zone and bounced
-   // Candle wick touched/entered the breaker zone, closed above it
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
-      // Check that a candle before bar 1 was above the breaker (true retest from above)
+      // Verify a candle before bar 1 had its low above breaker (was above, now retesting)
       bool wasAbove = false;
-      for(int k = 2; k < breaker.swingLowBar; k++)
+      for(int k = 2; k < breaker.swingExtremeBar; k++)
       {
          if(iLow(Symbol(), LTF_Period, k) > breaker.bottom)
          {
@@ -483,16 +522,16 @@ void CheckBuySetup()
 
    // Step 5: SL = the lowest point the breaker caused (the swing low)
    double sl = breaker.slLevel;
-   sl = sl - MarketInfo(Symbol(), MODE_SPREAD) * Point; // spread buffer
+   sl = sl - MarketInfo(Symbol(), MODE_SPREAD) * Point;
 
-   if(sl >= ask) return; // invalid SL
+   if(sl >= ask) return;
 
    // Step 6: Calculate TP based on RR
    double slDistance = ask - sl;
    double spreadCost = MarketInfo(Symbol(), MODE_SPREAD) * Point;
    double tp = ask + (slDistance * RR_Ratio) + spreadCost;
 
-   // Step 7: Calculate lot size based on risk
+   // Step 7: Calculate lot size
    double lotSize = CalculateLotSize(slDistance, OP_BUY);
    if(lotSize <= 0) return;
 
@@ -507,7 +546,8 @@ void CheckBuySetup()
    {
       Print("BUY #", ticket, " Entry=", ask, " SL=", sl, " TP=", tp,
             " Lots=", lotSize, " Opt=", (option1_signal ? "1" : "2"),
-            " Breaker=", breaker.bottom, "-", breaker.top);
+            " Breaker=", breaker.bottom, "-", breaker.top,
+            " RaidedFractal=", raid.fractalPrice);
    }
    else
    {
@@ -520,18 +560,17 @@ void CheckBuySetup()
 //+------------------------------------------------------------------+
 void CheckSellSetup()
 {
-   double raidedLevel = 0;
+   // Step 1: Find HTF fractal high raid (with temporal ordering)
+   RaidInfo raid;
+   if(!FindHTFFractalHighRaid(raid)) return;
 
-   // Step 1: Check if a HTF fractal high was raided
-   if(!IsHTFFractalHighRaided(raidedLevel)) return;
-
-   // Step 2: Find bearish breaker block
+   // Step 2: Find bearish breaker block (must be after raid)
    BreakerBlock breaker;
-   if(!FindBearishBreaker(breaker)) return;
+   if(!FindBearishBreaker(raid.raidBarLTF, breaker)) return;
 
-   // Step 3: Verify price has moved below the breaker zone after the swing high
+   // Step 3: Verify price has reversed and moved below the breaker zone
    bool priceBelowBreaker = false;
-   for(int k = breaker.swingLowBar - 1; k >= 1; k--)
+   for(int k = breaker.swingExtremeBar - 1; k >= 1; k--)
    {
       if(iClose(Symbol(), LTF_Period, k) < breaker.top)
       {
@@ -551,11 +590,11 @@ void CheckSellSetup()
    bool option1_signal = false;
    bool option2_signal = false;
 
-   // Option 1: RETEST - Price came back up to the breaker zone and got rejected
+   // Option 1: RETEST - Price came back up to breaker zone and got rejected
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
       bool wasBelow = false;
-      for(int k = 2; k < breaker.swingLowBar; k++)
+      for(int k = 2; k < breaker.swingExtremeBar; k++)
       {
          if(iHigh(Symbol(), LTF_Period, k) < breaker.top)
          {
@@ -566,7 +605,6 @@ void CheckSellSetup()
 
       if(wasBelow)
       {
-         // Retest: candle wicked into breaker zone but closed below it
          if(lastHigh >= breaker.top && lastClose < breaker.top && lastClose < lastOpen)
          {
             option1_signal = true;
@@ -587,20 +625,20 @@ void CheckSellSetup()
 
    // Step 5: SL = the highest point the breaker caused (the swing high)
    double sl = breaker.slLevel;
-   sl = sl + MarketInfo(Symbol(), MODE_SPREAD) * Point; // spread buffer
+   sl = sl + MarketInfo(Symbol(), MODE_SPREAD) * Point;
 
-   if(sl <= bid) return; // invalid SL
+   if(sl <= bid) return;
 
-   // Step 6: Calculate TP based on RR
+   // Step 6: Calculate TP
    double slDistance = sl - bid;
    double spreadCost = MarketInfo(Symbol(), MODE_SPREAD) * Point;
    double tp = bid - (slDistance * RR_Ratio) - spreadCost;
 
-   // Step 7: Calculate lot size based on risk
+   // Step 7: Calculate lot size
    double lotSize = CalculateLotSize(slDistance, OP_SELL);
    if(lotSize <= 0) return;
 
-   // Step 8: Check for duplicate trade at same breaker
+   // Step 8: Check for duplicate
    if(HasTradeAtLevel(breaker.top, OP_SELL)) return;
 
    // Step 9: Place the order
@@ -611,7 +649,8 @@ void CheckSellSetup()
    {
       Print("SELL #", ticket, " Entry=", bid, " SL=", sl, " TP=", tp,
             " Lots=", lotSize, " Opt=", (option1_signal ? "1" : "2"),
-            " Breaker=", breaker.bottom, "-", breaker.top);
+            " Breaker=", breaker.bottom, "-", breaker.top,
+            " RaidedFractal=", raid.fractalPrice);
    }
    else
    {
