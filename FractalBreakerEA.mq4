@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 
 //--- Input Parameters
@@ -24,8 +24,8 @@ input ENUM_TIMEFRAMES LTF_Period   = PERIOD_M1;   // Lower Timeframe (Breaker Bl
 input string     _sep3_           = "=== Entry Settings ===";
 enum ENTRY_MODE  { OPTION_1=0, OPTION_2=1, BOTH_OPTIONS=2 };
 input ENTRY_MODE EntryMode        = BOTH_OPTIONS; // Entry Mode
-// Option 1 = Retest of breaker block
-// Option 2 = Candle close above/below breaker
+// Option 1 = Retest of breaker block (price returns to zone after breaking above/below)
+// Option 2 = Candle close above/below breaker (after displacement, not the displacement itself)
 
 enum TRADE_DIR   { BOTH_DIRS=0, BUY_ONLY=1, SELL_ONLY=2 };
 input TRADE_DIR  TradeDirection   = BOTH_DIRS;    // Trade Direction
@@ -44,8 +44,8 @@ struct FractalLevel {
    double price;
    datetime time;
    int barIndex;
-   bool isHigh;          // true=fractal high, false=fractal low
-   int htfSource;        // 1 or 2 (which HTF detected it)
+   bool isHigh;
+   int htfSource;
 };
 
 struct BreakerBlock {
@@ -53,7 +53,8 @@ struct BreakerBlock {
    double bottom;
    datetime time;
    int barIndex;
-   bool isBullish;       // true = bullish breaker (looking for buys)
+   int displacementBar; // bar index of the displacement candle
+   bool isBullish;
 };
 
 //--- Arrays for detected levels
@@ -65,7 +66,7 @@ FractalLevel g_fractalHighs[];
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("FractalBreakerEA v1.10 initialized. HTF1=", EnumToString(HTF_Period_1),
+   Print("FractalBreakerEA v1.20 initialized. HTF1=", EnumToString(HTF_Period_1),
          " HTF2=", (UseHTF2 ? EnumToString(HTF_Period_2) : "Disabled"),
          " LTF=", EnumToString(LTF_Period));
    return(INIT_SUCCEEDED);
@@ -116,10 +117,8 @@ void DetectAllFractals()
    ArrayResize(g_fractalLows, 0);
    ArrayResize(g_fractalHighs, 0);
 
-   // Detect on HTF 1
    DetectFractalsOnTF(HTF_Period_1, 1);
 
-   // Detect on HTF 2 if enabled
    if(UseHTF2)
    {
       DetectFractalsOnTF(HTF_Period_2, 2);
@@ -196,7 +195,6 @@ bool IsFractalLowRaided(double &raidedLevel)
    {
       double fractalPrice = g_fractalLows[i].price;
 
-      // Check if any recent LTF candle went below the fractal (raided it)
       for(int j = 1; j <= LTF_LookbackBars; j++)
       {
          double lo = iLow(Symbol(), LTF_Period, j);
@@ -240,10 +238,13 @@ bool IsFractalHighRaided(double &raidedLevel)
 //+------------------------------------------------------------------+
 //| Find bullish breaker block on LTF (for BUY entries)              |
 //| Breaker = last bearish candle before bullish displacement         |
+//| Displacement candle confirms the breaker but is NOT the entry     |
 //+------------------------------------------------------------------+
 bool FindBullishBreaker(BreakerBlock &breaker)
 {
-   for(int i = 2; i < LTF_LookbackBars - 1; i++)
+   // Start from bar 3 minimum so displacement (i-1) is at least bar 2
+   // and bar 1 (entry check) is separate from displacement
+   for(int i = 3; i < LTF_LookbackBars - 1; i++)
    {
       double open_i  = iOpen(Symbol(), LTF_Period, i);
       double close_i = iClose(Symbol(), LTF_Period, i);
@@ -251,19 +252,21 @@ bool FindBullishBreaker(BreakerBlock &breaker)
       // Candle i must be bearish
       if(close_i >= open_i) continue;
 
-      // The candle after it must be bullish and close above the bearish candle's open
-      double close_after = iClose(Symbol(), LTF_Period, i - 1);
-      double open_after  = iOpen(Symbol(), LTF_Period, i - 1);
+      // The candle after it (i-1) must be bullish and close above the bearish candle's open
+      // This is the DISPLACEMENT candle - it confirms the breaker exists
+      double close_disp = iClose(Symbol(), LTF_Period, i - 1);
+      double open_disp  = iOpen(Symbol(), LTF_Period, i - 1);
 
-      if(close_after <= open_after) continue; // must be bullish
-      if(close_after <= open_i) continue;     // must close above breaker high
+      if(close_disp <= open_disp) continue; // displacement must be bullish
+      if(close_disp <= open_i) continue;    // displacement must close above breaker top
 
       // Valid bullish breaker found
-      breaker.top       = open_i;   // bearish candle open = top of breaker
-      breaker.bottom    = close_i;  // bearish candle close = bottom of breaker
-      breaker.time      = iTime(Symbol(), LTF_Period, i);
-      breaker.barIndex  = i;
-      breaker.isBullish = true;
+      breaker.top            = open_i;    // bearish candle open = top of breaker
+      breaker.bottom         = close_i;   // bearish candle close = bottom of breaker
+      breaker.time           = iTime(Symbol(), LTF_Period, i);
+      breaker.barIndex       = i;
+      breaker.displacementBar = i - 1;    // track displacement bar
+      breaker.isBullish      = true;
       return true;
    }
    return false;
@@ -275,7 +278,7 @@ bool FindBullishBreaker(BreakerBlock &breaker)
 //+------------------------------------------------------------------+
 bool FindBearishBreaker(BreakerBlock &breaker)
 {
-   for(int i = 2; i < LTF_LookbackBars - 1; i++)
+   for(int i = 3; i < LTF_LookbackBars - 1; i++)
    {
       double open_i  = iOpen(Symbol(), LTF_Period, i);
       double close_i = iClose(Symbol(), LTF_Period, i);
@@ -283,19 +286,21 @@ bool FindBearishBreaker(BreakerBlock &breaker)
       // Candle i must be bullish
       if(close_i <= open_i) continue;
 
-      // The candle after must be bearish and close below the bullish candle's open
-      double close_after = iClose(Symbol(), LTF_Period, i - 1);
-      double open_after  = iOpen(Symbol(), LTF_Period, i - 1);
+      // The candle after (i-1) must be bearish and close below the bullish candle's open
+      // This is the DISPLACEMENT candle
+      double close_disp = iClose(Symbol(), LTF_Period, i - 1);
+      double open_disp  = iOpen(Symbol(), LTF_Period, i - 1);
 
-      if(close_after >= open_after) continue; // must be bearish
-      if(close_after >= open_i) continue;     // must close below breaker low
+      if(close_disp >= open_disp) continue; // displacement must be bearish
+      if(close_disp >= open_i) continue;    // displacement must close below breaker bottom
 
       // Valid bearish breaker found
-      breaker.top       = close_i;  // bullish candle close = top of breaker
-      breaker.bottom    = open_i;   // bullish candle open = bottom of breaker
-      breaker.time      = iTime(Symbol(), LTF_Period, i);
-      breaker.barIndex  = i;
-      breaker.isBullish = false;
+      breaker.top            = close_i;  // bullish candle close = top of breaker
+      breaker.bottom         = open_i;   // bullish candle open = bottom of breaker
+      breaker.time           = iTime(Symbol(), LTF_Period, i);
+      breaker.barIndex       = i;
+      breaker.displacementBar = i - 1;
+      breaker.isBullish      = false;
       return true;
    }
    return false;
@@ -315,29 +320,63 @@ void CheckBuySetup()
    BreakerBlock breaker;
    if(!FindBullishBreaker(breaker)) return;
 
-   // Step 3: Check entry conditions based on option mode
+   // Step 3: Verify price has moved ABOVE the breaker zone after displacement
+   // (between displacement bar and current, price must have traded above breaker.top)
+   bool priceWentAbove = false;
+   for(int k = breaker.displacementBar - 1; k >= 1; k--)
+   {
+      if(iClose(Symbol(), LTF_Period, k) > breaker.top)
+      {
+         priceWentAbove = true;
+         break;
+      }
+   }
+   if(!priceWentAbove) return; // breaker not yet confirmed by price action above it
+
+   // Step 4: Check entry conditions on the LAST CLOSED candle (bar 1)
+   // Entry must be AFTER the displacement (bar 1 must not be the displacement bar)
    double ask = MarketInfo(Symbol(), MODE_ASK);
    double lastClose = iClose(Symbol(), LTF_Period, 1);
    double lastLow   = iLow(Symbol(), LTF_Period, 1);
+   double lastHigh  = iHigh(Symbol(), LTF_Period, 1);
    double lastOpen  = iOpen(Symbol(), LTF_Period, 1);
 
    bool option1_signal = false;
    bool option2_signal = false;
 
-   // Option 1: Price retests the breaker block (pulls back into it)
-   // Last candle touched or entered the breaker zone and bounced
+   // Option 1: RETEST - Price came back DOWN into the breaker zone and bounced
+   // The candle's low dipped into or below the breaker top, but closed back above it
+   // This means price was above the zone, came back to test it, and held
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
-      if(lastLow <= breaker.top && lastClose > breaker.top && lastClose > lastOpen)
+      // Verify price was above breaker before this candle (true retest)
+      bool wasAboveBefore = false;
+      for(int k = 2; k < breaker.displacementBar; k++)
       {
-         option1_signal = true;
+         if(iLow(Symbol(), LTF_Period, k) > breaker.top)
+         {
+            wasAboveBefore = true;
+            break;
+         }
+      }
+
+      if(wasAboveBefore)
+      {
+         // Retest: candle dipped into the breaker zone but closed above it (bounce)
+         if(lastLow <= breaker.top && lastLow >= breaker.bottom &&
+            lastClose > breaker.top && lastClose > lastOpen)
+         {
+            option1_signal = true;
+         }
       }
    }
 
    // Option 2: Candle closes above the breaker block
+   // Must NOT be the displacement candle itself
    if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
    {
-      if(lastClose > breaker.top && lastOpen < breaker.top)
+      // Candle opens below or inside the breaker zone and closes above it
+      if(lastOpen <= breaker.top && lastClose > breaker.top)
       {
          option2_signal = true;
       }
@@ -345,25 +384,25 @@ void CheckBuySetup()
 
    if(!option1_signal && !option2_signal) return;
 
-   // Step 4: Calculate SL - lowest point between breaker and entry candle
+   // Step 5: Calculate SL - lowest point between breaker and entry candle
    double sl = FindLowestBetween(breaker.barIndex, 1);
-   sl = sl - MarketInfo(Symbol(), MODE_SPREAD) * Point; // add spread buffer
+   sl = sl - MarketInfo(Symbol(), MODE_SPREAD) * Point; // spread buffer
 
    if(sl >= ask) return; // invalid SL
 
-   // Step 5: Calculate TP based on RR
+   // Step 6: Calculate TP based on RR
    double slDistance = ask - sl;
    double spreadCost = MarketInfo(Symbol(), MODE_SPREAD) * Point;
    double tp = ask + (slDistance * RR_Ratio) + spreadCost;
 
-   // Step 6: Calculate lot size based on risk
+   // Step 7: Calculate lot size based on risk
    double lotSize = CalculateLotSize(slDistance, OP_BUY);
    if(lotSize <= 0) return;
 
-   // Step 7: Check for duplicate trade at same breaker
+   // Step 8: Check for duplicate trade at same breaker
    if(HasTradeAtLevel(breaker.top, OP_BUY)) return;
 
-   // Step 8: Place the order
+   // Step 9: Place the order
    string comment = "FBE_BUY_OPT" + IntegerToString(option1_signal ? 1 : 2);
    int ticket = OrderSend(Symbol(), OP_BUY, lotSize, ask, 3, sl, tp, comment, MagicNumber, 0, clrGreen);
 
@@ -392,28 +431,58 @@ void CheckSellSetup()
    BreakerBlock breaker;
    if(!FindBearishBreaker(breaker)) return;
 
-   // Step 3: Check entry conditions
+   // Step 3: Verify price has moved BELOW the breaker zone after displacement
+   bool priceWentBelow = false;
+   for(int k = breaker.displacementBar - 1; k >= 1; k--)
+   {
+      if(iClose(Symbol(), LTF_Period, k) < breaker.bottom)
+      {
+         priceWentBelow = true;
+         break;
+      }
+   }
+   if(!priceWentBelow) return;
+
+   // Step 4: Check entry conditions on bar 1
    double bid = MarketInfo(Symbol(), MODE_BID);
    double lastClose = iClose(Symbol(), LTF_Period, 1);
    double lastHigh  = iHigh(Symbol(), LTF_Period, 1);
+   double lastLow   = iLow(Symbol(), LTF_Period, 1);
    double lastOpen  = iOpen(Symbol(), LTF_Period, 1);
 
    bool option1_signal = false;
    bool option2_signal = false;
 
-   // Option 1: Price retests the breaker block (pulls back into it) and gets rejected
+   // Option 1: RETEST - Price came back UP into the breaker zone and got rejected
    if(EntryMode == OPTION_1 || EntryMode == BOTH_OPTIONS)
    {
-      if(lastHigh >= breaker.bottom && lastClose < breaker.bottom && lastClose < lastOpen)
+      // Verify price was below breaker before this candle (true retest)
+      bool wasBelowBefore = false;
+      for(int k = 2; k < breaker.displacementBar; k++)
       {
-         option1_signal = true;
+         if(iHigh(Symbol(), LTF_Period, k) < breaker.bottom)
+         {
+            wasBelowBefore = true;
+            break;
+         }
+      }
+
+      if(wasBelowBefore)
+      {
+         // Retest: candle wicked into the breaker zone but closed below it (rejection)
+         if(lastHigh >= breaker.bottom && lastHigh <= breaker.top &&
+            lastClose < breaker.bottom && lastClose < lastOpen)
+         {
+            option1_signal = true;
+         }
       }
    }
 
    // Option 2: Candle closes below the breaker block
    if(EntryMode == OPTION_2 || EntryMode == BOTH_OPTIONS)
    {
-      if(lastClose < breaker.bottom && lastOpen > breaker.bottom)
+      // Candle opens above or inside the breaker zone and closes below it
+      if(lastOpen >= breaker.bottom && lastClose < breaker.bottom)
       {
          option2_signal = true;
       }
@@ -421,25 +490,25 @@ void CheckSellSetup()
 
    if(!option1_signal && !option2_signal) return;
 
-   // Step 4: Calculate SL - highest point between breaker and entry candle
+   // Step 5: Calculate SL - highest point between breaker and entry candle
    double sl = FindHighestBetween(breaker.barIndex, 1);
-   sl = sl + MarketInfo(Symbol(), MODE_SPREAD) * Point; // add spread buffer
+   sl = sl + MarketInfo(Symbol(), MODE_SPREAD) * Point; // spread buffer
 
    if(sl <= bid) return; // invalid SL
 
-   // Step 5: Calculate TP based on RR
+   // Step 6: Calculate TP based on RR
    double slDistance = sl - bid;
    double spreadCost = MarketInfo(Symbol(), MODE_SPREAD) * Point;
    double tp = bid - (slDistance * RR_Ratio) - spreadCost;
 
-   // Step 6: Calculate lot size based on risk
+   // Step 7: Calculate lot size based on risk
    double lotSize = CalculateLotSize(slDistance, OP_SELL);
    if(lotSize <= 0) return;
 
-   // Step 7: Check for duplicate trade at same breaker
+   // Step 8: Check for duplicate trade at same breaker
    if(HasTradeAtLevel(breaker.bottom, OP_SELL)) return;
 
-   // Step 8: Place the order
+   // Step 9: Place the order
    string comment = "FBE_SELL_OPT" + IntegerToString(option1_signal ? 1 : 2);
    int ticket = OrderSend(Symbol(), OP_SELL, lotSize, bid, 3, sl, tp, comment, MagicNumber, 0, clrRed);
 
