@@ -4,7 +4,7 @@
 //|                                    Block Entry Expert Advisor    |
 //+------------------------------------------------------------------+
 #property copyright "FractalBreakerEA"
-#property version   "2.20"
+#property version   "2.21"
 #property strict
 
 //--- Input Parameters
@@ -73,6 +73,7 @@ struct BreakerInfo {
 //--- Arrays
 FractalLevel g_htfFractalLows[];
 FractalLevel g_htfFractalHighs[];
+int g_debugCounter = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -96,10 +97,8 @@ void OnTick()
 
    DetectHTFFractals();
 
-   // Log fractal counts periodically
-   static int s_debugCounter = 0;
-   s_debugCounter++;
-   if(EnableDebugLog && s_debugCounter % 60 == 1)
+   g_debugCounter++;
+   if(EnableDebugLog && g_debugCounter % 60 == 1)
    {
       Print("DEBUG FRACTALS: ", ArraySize(g_htfFractalLows), " lows, ",
             ArraySize(g_htfFractalHighs), " highs detected on HTF");
@@ -397,7 +396,7 @@ void CheckBuySetup()
    RaidInfo raid;
    if(!FindHTFFractalLowRaid(raid))
    {
-      if(EnableDebugLog && s_debugCounter % 60 == 1)
+      if(EnableDebugLog && g_debugCounter % 60 == 1)
          Print("DEBUG BUY: No HTF fractal low raid found");
       return;
    }
